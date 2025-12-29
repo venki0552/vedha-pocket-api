@@ -37,21 +37,21 @@ export function createUserClient(
   supabaseAnonKey: string,
   accessToken?: string
 ): SupabaseClient {
-  const client = createSupabaseClient({
-    supabaseUrl,
-    supabaseKey: supabaseAnonKey,
-    isServiceRole: false,
+  // Create client with the access token in global headers
+  return createClient(supabaseUrl, supabaseAnonKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+    db: {
+      schema: 'public',
+    },
+    global: {
+      headers: accessToken ? {
+        Authorization: `Bearer ${accessToken}`,
+      } : {},
+    },
   });
-
-  // If access token provided, set it for the session
-  if (accessToken) {
-    client.auth.setSession({
-      access_token: accessToken,
-      refresh_token: '',
-    });
-  }
-
-  return client;
 }
 
 export type { SupabaseClient };

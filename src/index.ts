@@ -67,10 +67,11 @@ app.decorateRequest('userId', null);
 // Auth hook for protected routes
 app.addHook('onRequest', async (request: FastifyRequest, _reply: FastifyReply) => {
   // Always add service client
-  (request as any).supabaseService = createServiceClient(
+  const serviceClient = createServiceClient(
     env.SUPABASE_URL,
     env.SUPABASE_SERVICE_ROLE_KEY
   );
+  (request as any).supabaseService = serviceClient;
 
   // Skip auth for health check
   if (request.url === '/health') return;
@@ -83,20 +84,20 @@ app.addHook('onRequest', async (request: FastifyRequest, _reply: FastifyReply) =
 
   const token = authHeader.slice(7);
   
-  // Create user client with token
+  // Verify token using service client (more reliable)
+  const { data: { user }, error } = await serviceClient.auth.getUser(token);
+  
+  if (error || !user) {
+    app.log.warn({ error: error?.message }, 'Token verification failed');
+    return;
+  }
+
+  // Create user client with verified token for RLS
   const userClient = createUserClient(
     env.SUPABASE_URL,
     env.SUPABASE_ANON_KEY,
     token
   );
-  
-  // Verify token
-  const { data: { user }, error } = await userClient.auth.getUser();
-  
-  if (error || !user) {
-    // Token invalid but some routes may not require auth
-    return;
-  }
 
   (request as any).supabaseUser = userClient;
   (request as any).userId = user.id;
