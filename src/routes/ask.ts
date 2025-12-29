@@ -4,6 +4,125 @@ import { OpenRouterEmbeddingProvider, OpenRouterChatProvider, type Citation } fr
 import { requireAuth, getUserId, getSupabaseClients } from '../middleware/auth.js';
 import { env } from '../config/env.js';
 
+// Number of additional search queries to generate
+const MULTI_QUERY_COUNT = 2;
+
+/**
+ * Generate additional search queries using LLM for better retrieval coverage
+ */
+async function generateSearchQueries(
+  originalQuery: string,
+  apiKey: string,
+  baseUrl: string,
+  model: string
+): Promise<string[]> {
+  const systemPrompt = `You are a search query generator. Given a user question, generate ${MULTI_QUERY_COUNT} alternative search queries that would help find relevant information.
+Rules:
+- Keep queries concise (max 10 words each)
+- Make queries diverse but relevant to the original question
+- Do not add new concepts not present in the original question
+- Return ONLY a JSON array of strings, nothing else`;
+
+  const userPrompt = `Generate ${MULTI_QUERY_COUNT} alternative search queries for: "${originalQuery}"
+
+Return as JSON array, e.g.: ["query 1", "query 2"]`;
+
+  try {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.7,
+        max_tokens: 200,
+      }),
+    });
+
+    if (!response.ok) {
+      console.warn('Failed to generate additional queries, using original only');
+      return [originalQuery];
+    }
+
+    const data = await response.json() as {
+      choices: { message: { content: string } }[];
+    };
+
+    const content = data.choices[0]?.message?.content || '';
+    
+    // Parse JSON array from response
+    const match = content.match(/\[[\s\S]*\]/);
+    if (match) {
+      const queries = JSON.parse(match[0]) as string[];
+      // Return original + generated queries
+      return [originalQuery, ...queries.slice(0, MULTI_QUERY_COUNT)];
+    }
+  } catch (error) {
+    console.warn('Error generating search queries:', error);
+  }
+  
+  return [originalQuery];
+}
+
+/**
+ * Search with multiple queries and fuse/deduplicate results
+ */
+async function multiQuerySearch(
+  queries: string[],
+  pocketId: string,
+  embeddingProvider: OpenRouterEmbeddingProvider,
+  service: any
+): Promise<any[]> {
+  // Generate embeddings for all queries
+  const embeddings = await embeddingProvider.embed(queries);
+  
+  // Search with each query
+  const allResults: Map<string, any> = new Map();
+  
+  for (let i = 0; i < queries.length; i++) {
+    const { data: chunks, error } = await service.rpc('hybrid_search', {
+      query_embedding: `[${embeddings[i].join(',')}]`,
+      query_text: queries[i],
+      target_pocket_id: pocketId,
+      match_count: RAG_CONTEXT_CHUNKS,
+      vector_weight: VECTOR_WEIGHT,
+      fts_weight: FTS_WEIGHT,
+    });
+
+    if (error) {
+      console.warn(`Search failed for query "${queries[i]}":`, error);
+      continue;
+    }
+
+    // Deduplicate by chunk ID and aggregate scores
+    for (const chunk of (chunks || [])) {
+      const existing = allResults.get(chunk.id);
+      if (existing) {
+        // Average the scores
+        existing.similarity = (existing.similarity + chunk.similarity) / 2;
+        existing.queryCount = (existing.queryCount || 1) + 1;
+      } else {
+        allResults.set(chunk.id, { ...chunk, queryCount: 1 });
+      }
+    }
+  }
+  
+  // Sort by combined score and return top results
+  const results = Array.from(allResults.values())
+    .sort((a, b) => b.similarity - a.similarity)
+    .slice(0, RAG_CONTEXT_CHUNKS);
+  
+  console.log(`🔍 Multi-query search: ${queries.length} queries, ${allResults.size} unique chunks, returning ${results.length}`);
+  
+  return results;
+}
+
 export async function askRoutes(app: FastifyInstance) {
   // All ask routes require auth
   app.addHook('preHandler', requireAuth);
@@ -65,32 +184,30 @@ export async function askRoutes(app: FastifyInstance) {
         citations: null,
       });
 
-      // Get query embedding
+      // Create embedding provider
       const embeddingProvider = new OpenRouterEmbeddingProvider({
         apiKey: env.OPENROUTER_API_KEY,
         baseUrl: env.OPENROUTER_BASE_URL,
         embedModel: env.OPENROUTER_EMBED_MODEL,
       });
 
-      const [queryEmbedding] = await embeddingProvider.embed([body.query]);
+      // Generate multiple search queries for better retrieval
+      const searchQueries = await generateSearchQueries(
+        body.query,
+        env.OPENROUTER_API_KEY,
+        env.OPENROUTER_BASE_URL,
+        env.OPENROUTER_CHAT_MODEL
+      );
+      
+      app.log.info(`Multi-query RAG: ${searchQueries.length} queries: ${searchQueries.join(' | ')}`);
 
-      // Retrieve relevant chunks using hybrid search
-      const { data: chunks, error: searchError } = await service.rpc('hybrid_search', {
-        query_embedding: `[${queryEmbedding.join(',')}]`,
-        query_text: body.query,
-        target_pocket_id: body.pocket_id,
-        match_count: RAG_CONTEXT_CHUNKS,
-        vector_weight: VECTOR_WEIGHT,
-        fts_weight: FTS_WEIGHT,
-      });
-
-      if (searchError) {
-        app.log.error(searchError);
-        return reply.status(500).send({
-          code: 'SEARCH_ERROR',
-          message: 'Failed to retrieve relevant context',
-        });
-      }
+      // Retrieve relevant chunks using multi-query hybrid search
+      const chunks = await multiQuerySearch(
+        searchQueries,
+        body.pocket_id,
+        embeddingProvider,
+        service
+      );
 
       // Check if we have any chunks
       if (!chunks || chunks.length === 0) {
