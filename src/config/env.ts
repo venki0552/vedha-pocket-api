@@ -9,12 +9,22 @@ const envSchema = z.object({
   // Redis
   REDIS_URL: z.string().min(1),
 
-  // OpenRouter
+  // LLM Configuration - supports OpenRouter, Ollama, LM Studio, vLLM, etc.
+  // If LLM_BASE_URL is set, it takes precedence over OPENROUTER_BASE_URL
+  LLM_BASE_URL: z.string().url().optional(),
+  LLM_API_KEY: z.string().optional(),
+
+  // OpenRouter (default if LLM_BASE_URL not set)
   OPENROUTER_API_KEY: z.string().min(1),
   OPENROUTER_BASE_URL: z.string().url().default('https://openrouter.ai/api/v1'),
   OPENROUTER_EMBED_MODEL: z.string().default('openai/text-embedding-3-small'),
   OPENROUTER_CHAT_MODEL: z.string().default('google/gemma-3-27b-it:free'),
   OPENROUTER_FALLBACK_CHAT_MODEL: z.string().default('openai/gpt-4o-mini'),
+
+  // Embedding model (can be different from chat model provider)
+  EMBED_BASE_URL: z.string().url().optional(),
+  EMBED_API_KEY: z.string().optional(),
+  EMBED_MODEL: z.string().optional(),
 
   // Encryption
   MASTER_KEY: z.string().min(32).optional(),
