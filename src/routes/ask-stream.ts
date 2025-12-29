@@ -169,19 +169,31 @@ async function* streamChatCompletion(
   model: string,
   fallbackModel: string
 ): AsyncGenerator<SSEEvent, { answer: string; model: string }, void> {
-  const systemPrompt = `You are a helpful research assistant. Answer the user's question based on the provided sources.
-Rules:
-- Use ONLY information from the sources provided
-- If you use information from a source, cite it using [source_id] format
-- If the sources don't contain relevant information, say so
-- Be concise but thorough
-- Format your response in clear paragraphs`;
+  // Build sources text with proper formatting
+  let sourcesText = '';
+  sources.forEach((s, i) => {
+    const pageInfo = s.page ? ` (Page ${s.page})` : '';
+    sourcesText += `\n---SOURCE ${i + 1}: [${s.title || 'Untitled'}]${pageInfo}---\n`;
+    sourcesText += s.text;
+    sourcesText += `\n---END SOURCE ${i + 1}---\n`;
+  });
 
-  const sourcesText = sources
-    .map((s, i) => `[${s.id}] (${s.title || 'Untitled'}): ${s.text}`)
-    .join('\n\n');
+  const systemPrompt = `You are a helpful assistant that answers questions based ONLY on the provided sources.
 
-  const userPrompt = `Sources:\n${sourcesText}\n\nQuestion: ${userMessage}`;
+CRITICAL INSTRUCTIONS:
+1. NEVER hallucinate or make up information. Only use facts from the provided sources.
+2. If the answer is not in the sources, say "I couldn't find this information in your saved sources."
+3. Always cite your sources using [Source N] format where N is the source number.
+4. Be precise and factual. Do not speculate or add information beyond what's in the sources.
+5. If sources contradict each other, mention this discrepancy.
+6. Provide direct quotes when appropriate, using quotation marks.
+
+AVAILABLE SOURCES:
+${sourcesText}
+
+Remember: Only answer from the sources above. If you cannot find relevant information, clearly state this. Do NOT make up facts.`;
+
+  const userPrompt = userMessage;
 
   let currentModel = model;
   let attempt = 0;
@@ -264,17 +276,21 @@ Rules:
 }
 
 /**
- * Extract citations from answer text
+ * Extract citations from answer text ([Source N] format)
  */
 function extractCitations(answer: string, sources: any[]): Citation[] {
   const citations: Citation[] = [];
-  const citationPattern = /\[([^\]]+)\]/g;
+  const citedSources = new Set<number>();
+  
+  // Find all [Source N] patterns
+  const citationPattern = /\[Source\s*(\d+)\]/gi;
   let match;
 
   while ((match = citationPattern.exec(answer)) !== null) {
-    const sourceId = match[1];
-    const source = sources.find((s) => s.id === sourceId);
-    if (source) {
+    const sourceIndex = parseInt(match[1], 10) - 1; // Convert 1-based to 0-based index
+    if (sourceIndex >= 0 && sourceIndex < sources.length && !citedSources.has(sourceIndex)) {
+      citedSources.add(sourceIndex);
+      const source = sources[sourceIndex];
       citations.push({
         chunk_id: source.id,
         source_id: source.source_id,
@@ -285,13 +301,7 @@ function extractCitations(answer: string, sources: any[]): Citation[] {
     }
   }
 
-  // Deduplicate
-  const seen = new Set<string>();
-  return citations.filter((c) => {
-    if (seen.has(c.chunk_id)) return false;
-    seen.add(c.chunk_id);
-    return true;
-  });
+  return citations;
 }
 
 export async function askStreamRoutes(app: FastifyInstance) {
