@@ -117,6 +117,59 @@ export async function memoryRoutes(app: FastifyInstance) {
     return { data: uniqueTags };
   });
 
+  // Reprocess all published memories (for embedding)
+  app.post('/reprocess-published', async (request: FastifyRequest<{ Body: { org_id?: string } }>, reply: FastifyReply) => {
+    const { user } = getSupabaseClients(request);
+    const userId = getUserId(request);
+    const org_id = (request.body as { org_id?: string })?.org_id;
+
+    // Get all published memories
+    let query = user
+      .from('memories')
+      .select('id, org_id')
+      .eq('user_id', userId)
+      .eq('status', 'published');
+
+    if (org_id) {
+      query = query.eq('org_id', org_id);
+    }
+
+    const { data: memories, error } = await query;
+
+    if (error) {
+      app.log.error(error);
+      return reply.status(500).send({
+        code: 'DATABASE_ERROR',
+        message: 'Failed to fetch memories',
+      });
+    }
+
+    if (!memories || memories.length === 0) {
+      return { data: { queued: 0, message: 'No published memories found' } };
+    }
+
+    // Queue all for reprocessing
+    const queue = getQueue();
+    let queued = 0;
+
+    for (const memory of memories) {
+      try {
+        await queue.add('chunk-memory', {
+          memoryId: memory.id,
+          orgId: memory.org_id,
+          userId: userId,
+        }, {
+          priority: 2,
+        });
+        queued++;
+      } catch (err) {
+        app.log.error(err, `Failed to queue memory ${memory.id}`);
+      }
+    }
+
+    return { data: { queued, total: memories.length, message: `Queued ${queued} memories for reprocessing` } };
+  });
+
   // Create memory
   app.post('/', async (request: FastifyRequest, reply: FastifyReply) => {
     const { user } = getSupabaseClients(request);
