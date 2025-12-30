@@ -40,7 +40,7 @@ export async function memoryRoutes(app: FastifyInstance) {
   }>, reply: FastifyReply) => {
     const { user } = getSupabaseClients(request);
     const userId = getUserId(request);
-    const { org_id, status = 'all', archived = 'false', tag, color } = request.query;
+    const { org_id, status = 'all', archived, tag, color } = request.query;
 
     let query = user
       .from('memories')
