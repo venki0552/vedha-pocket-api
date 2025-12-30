@@ -5,6 +5,9 @@ import { requireAuth, getUserId, getSupabaseClients } from '../middleware/auth.j
 import { getEncryptedKey } from '../services/encryption.js';
 import { env } from '../config/env.js';
 
+// Number of additional search queries to generate
+const MULTI_QUERY_COUNT = 2;
+
 // Validation schemas
 const askMemorySchema = z.object({
   org_id: z.string().uuid(),
@@ -13,7 +16,7 @@ const askMemorySchema = z.object({
 });
 
 // SSE event types
-type SSEEventType = 'status' | 'sources' | 'token' | 'done' | 'error' | 'thinking';
+type SSEEventType = 'status' | 'queries' | 'sources' | 'token' | 'done' | 'error' | 'thinking';
 
 interface SSEEvent {
   type: SSEEventType;
@@ -22,6 +25,222 @@ interface SSEEvent {
 
 function formatSSE(event: SSEEvent): string {
   return `data: ${JSON.stringify(event)}\n\n`;
+}
+
+/**
+ * Generate additional search queries using LLM for better retrieval coverage
+ */
+async function generateSearchQueries(
+  originalQuery: string,
+  apiKey: string,
+  baseUrl: string,
+  model: string
+): Promise<string[]> {
+  const systemPrompt = `You are a search query generator. Given a user question, generate ${MULTI_QUERY_COUNT} alternative search queries that would help find relevant information.
+Rules:
+- Keep queries concise (max 10 words each)
+- Make queries diverse but relevant to the original question
+- Do not add new concepts not present in the original question
+- Return ONLY a JSON array of strings, nothing else`;
+
+  const userPrompt = `Generate ${MULTI_QUERY_COUNT} alternative search queries for: "${originalQuery}"
+
+Return as JSON array, e.g.: ["query 1", "query 2"]`;
+
+  try {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.7,
+        max_tokens: 200,
+      }),
+    });
+
+    if (!response.ok) {
+      console.warn('Failed to generate additional queries, using original only');
+      return [originalQuery];
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content || '';
+
+    // Parse JSON array from response
+    const match = content.match(/\[[\s\S]*\]/);
+    if (match) {
+      const queries = JSON.parse(match[0]) as string[];
+      return [originalQuery, ...queries.slice(0, MULTI_QUERY_COUNT)];
+    }
+  } catch (error) {
+    console.warn('Error generating search queries:', error);
+  }
+
+  return [originalQuery];
+}
+
+/**
+ * Search with multiple queries and fuse/deduplicate results
+ */
+async function multiQueryMemorySearch(
+  queries: string[],
+  userId: string,
+  orgId: string,
+  embeddingProvider: OpenRouterEmbeddingProvider,
+  service: any
+): Promise<any[]> {
+  // Generate embeddings for all queries
+  const embeddings = await embeddingProvider.embed(queries);
+
+  // Search with each query
+  const allResults: Map<string, any> = new Map();
+
+  for (let i = 0; i < queries.length; i++) {
+    const { data: chunks, error } = await service.rpc('memory_hybrid_search', {
+      p_user_id: userId,
+      p_org_id: orgId,
+      p_query_embedding: `[${embeddings[i].join(',')}]`,
+      p_query_text: queries[i],
+      p_limit: 10,
+      p_semantic_weight: 0.7,
+    });
+
+    if (error) {
+      console.warn(`Search failed for query "${queries[i]}":`, error);
+      continue;
+    }
+
+    // Deduplicate by chunk ID and aggregate scores
+    for (const chunk of chunks || []) {
+      const existing = allResults.get(chunk.chunk_id);
+      if (existing) {
+        // Average the scores
+        existing.combined_score = (existing.combined_score + chunk.combined_score) / 2;
+        existing.queryCount = (existing.queryCount || 1) + 1;
+      } else {
+        allResults.set(chunk.chunk_id, { ...chunk, queryCount: 1 });
+      }
+    }
+  }
+
+  // Sort by combined score and return top results
+  const results = Array.from(allResults.values())
+    .sort((a, b) => b.combined_score - a.combined_score)
+    .slice(0, 10);
+
+  return results;
+}
+
+/**
+ * Stream chat completion with fallback model support
+ */
+async function* streamChatCompletion(
+  memoriesText: string,
+  userMessage: string,
+  apiKey: string,
+  baseUrl: string,
+  model: string,
+  fallbackModel: string
+): AsyncGenerator<SSEEvent, { answer: string; model: string }, void> {
+  const systemPrompt = `You are a helpful assistant that answers questions based ONLY on the user's memories.
+
+CRITICAL INSTRUCTIONS:
+1. NEVER hallucinate or make up information. Only use facts from the provided memories.
+2. If the answer is not in the memories, say "I couldn't find this information in your memories."
+3. Always cite your sources using [Memory N] format where N is the memory number.
+4. Be precise and factual. Do not speculate or add information beyond what's in the memories.
+5. Provide direct quotes when appropriate, using quotation marks.
+
+YOUR MEMORIES:
+${memoriesText}
+
+Remember: Only answer from the memories above. If you cannot find relevant information, clearly state this.`;
+
+  let currentModel = model;
+  let attempt = 0;
+  const maxAttempts = 2;
+
+  while (attempt < maxAttempts) {
+    try {
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: currentModel,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userMessage },
+          ],
+          stream: true,
+          max_tokens: 2000,
+        }),
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(`API returned ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let fullAnswer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') continue;
+
+          try {
+            const parsed = JSON.parse(data);
+            
+            // Check for reasoning/thinking content
+            const reasoning = parsed.choices?.[0]?.delta?.reasoning;
+            if (reasoning) {
+              yield { type: 'thinking', payload: reasoning };
+            }
+
+            const content = parsed.choices?.[0]?.delta?.content || '';
+            if (content) {
+              fullAnswer += content;
+              yield { type: 'token', payload: content };
+            }
+          } catch {
+            continue;
+          }
+        }
+      }
+
+      return { answer: fullAnswer, model: currentModel };
+    } catch (error) {
+      console.error(`Chat completion failed with ${currentModel}:`, error);
+      if (attempt === 0 && fallbackModel && fallbackModel !== currentModel) {
+        currentModel = fallbackModel;
+        attempt++;
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw new Error('All chat completion attempts failed');
 }
 
 interface Citation {
@@ -230,30 +449,30 @@ export async function generalChatRoutes(app: FastifyInstance) {
       const baseUrl = 'https://openrouter.ai/api/v1';
       const embeddingModel = 'openai/text-embedding-3-small';
       const chatModel = env.DEFAULT_CHAT_MODEL || 'google/gemma-3-27b-it:free';
+      const fallbackModel = env.OPENROUTER_FALLBACK_CHAT_MODEL || 'google/gemma-3-27b-it:free';
 
-      // Generate embedding for the question
+      // Step 1: Generate search queries for better retrieval
+      sendEvent({ type: 'status', payload: 'Generating search queries...' });
+      const searchQueries = await generateSearchQueries(body.question, apiKey, baseUrl, chatModel);
+      sendEvent({ type: 'queries', payload: searchQueries });
+
+      // Step 2: Create embedding provider
       const embeddingProvider = new OpenRouterEmbeddingProvider({
         apiKey,
         baseUrl,
         embedModel: embeddingModel,
         chatModel,
       });
-      const [queryEmbedding] = await embeddingProvider.embed([body.question]);
 
-      // Search memories using hybrid search
-      const { data: chunks, error: searchError } = await service.rpc('memory_hybrid_search', {
-        p_user_id: userId,
-        p_org_id: body.org_id,
-        p_query_embedding: `[${queryEmbedding.join(',')}]`,
-        p_query_text: body.question,
-        p_limit: 10,
-        p_semantic_weight: 0.7,
-      });
-
-      if (searchError) {
-        app.log.error(searchError);
-        throw new Error('Search failed');
-      }
+      // Step 3: Multi-query search
+      sendEvent({ type: 'status', payload: `Searching ${searchQueries.length} queries...` });
+      const chunks = await multiQueryMemorySearch(
+        searchQueries,
+        userId,
+        body.org_id,
+        embeddingProvider,
+        service
+      );
 
       if (!chunks || chunks.length === 0) {
         sendEvent({ type: 'status', payload: 'No relevant memories found' });
@@ -282,7 +501,7 @@ export async function generalChatRoutes(app: FastifyInstance) {
         snippet: c.chunk_text.substring(0, 150) + '...',
       }));
       sendEvent({ type: 'sources', payload: sourcePreviews });
-      sendEvent({ type: 'status', payload: 'Generating answer...' });
+      sendEvent({ type: 'status', payload: `Retrieved ${chunks.length} chunks, generating answer...` });
 
       // Build context for LLM
       let memoriesText = '';
@@ -292,78 +511,23 @@ export async function generalChatRoutes(app: FastifyInstance) {
         memoriesText += `\n---END MEMORY ${i + 1}---\n`;
       });
 
-      const systemPrompt = `You are a helpful assistant that answers questions based ONLY on the user's memories.
+      // Step 4: Stream chat completion with fallback support
+      const chatGen = streamChatCompletion(
+        memoriesText,
+        body.question,
+        apiKey,
+        baseUrl,
+        chatModel,
+        fallbackModel
+      );
 
-CRITICAL INSTRUCTIONS:
-1. NEVER hallucinate or make up information. Only use facts from the provided memories.
-2. If the answer is not in the memories, say "I couldn't find this information in your memories."
-3. Always cite your sources using [Memory N] format where N is the memory number.
-4. Be precise and factual. Do not speculate or add information beyond what's in the memories.
-5. Provide direct quotes when appropriate, using quotation marks.
-
-YOUR MEMORIES:
-${memoriesText}
-
-Remember: Only answer from the memories above. If you cannot find relevant information, clearly state this.`;
-
-      // Stream chat completion
-      const response = await fetch(`${baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: chatModel,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: body.question },
-          ],
-          stream: true,
-          max_tokens: 2000,
-        }),
-      });
-
-      if (!response.ok || !response.body) {
-        throw new Error(`Chat API returned ${response.status}`);
+      let chatResult = await chatGen.next();
+      while (!chatResult.done) {
+        sendEvent(chatResult.value);
+        chatResult = await chatGen.next();
       }
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let fullAnswer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6).trim();
-          if (data === '[DONE]') continue;
-
-          try {
-            const parsed = JSON.parse(data);
-            
-            const reasoning = parsed.choices?.[0]?.delta?.reasoning;
-            if (reasoning) {
-              sendEvent({ type: 'thinking', payload: reasoning });
-            }
-
-            const content = parsed.choices?.[0]?.delta?.content || '';
-            if (content) {
-              fullAnswer += content;
-              sendEvent({ type: 'token', payload: content });
-            }
-          } catch {
-            continue;
-          }
-        }
-      }
+      const { answer: fullAnswer, model: usedModel } = chatResult.value!;
 
       // Extract citations
       const citations = extractCitations(fullAnswer, chunks);
@@ -382,7 +546,7 @@ Remember: Only answer from the memories above. If you cannot find relevant infor
           .eq('id', conversationId);
       }
 
-      sendEvent({ type: 'done', payload: { conversation_id: conversationId, citations } });
+      sendEvent({ type: 'done', payload: { conversation_id: conversationId, citations, model: usedModel } });
     } catch (error: any) {
       app.log.error(error);
       sendEvent({ type: 'error', payload: error.message || 'An error occurred' });
