@@ -229,7 +229,7 @@ export async function generalChatRoutes(app: FastifyInstance) {
 
       const baseUrl = 'https://openrouter.ai/api/v1';
       const embeddingModel = 'openai/text-embedding-3-small';
-      const chatModel = env.DEFAULT_CHAT_MODEL || 'anthropic/claude-3.5-sonnet';
+      const chatModel = env.DEFAULT_CHAT_MODEL || 'google/gemma-3-27b-it:free';
 
       // Generate embedding for the question
       const embeddingProvider = new OpenRouterEmbeddingProvider({
