@@ -19,6 +19,11 @@ import { statsRoutes } from './routes/stats.js';
 import { taskRoutes } from './routes/tasks.js';
 import { analyticsRoutes } from './routes/analytics.js';
 import { settingsRoutes } from './routes/settings.js';
+// New Memory Palace routes
+import { memoryRoutes } from './routes/memories.js';
+import { memoryShareRoutes } from './routes/memory-shares.js';
+import { memoryCommentRoutes } from './routes/memory-comments.js';
+import { generalChatRoutes } from './routes/general-chat.js';
 
 // Initialize Sentry
 if (env.SENTRY_DSN) {
@@ -152,6 +157,11 @@ await app.register(statsRoutes, { prefix: '/stats' });
 await app.register(taskRoutes, { prefix: '/tasks' });
 await app.register(analyticsRoutes, { prefix: '/analytics' });
 await app.register(settingsRoutes, { prefix: '/settings' });
+// Memory Palace routes
+await app.register(memoryRoutes, { prefix: '/memories' });
+await app.register(memoryShareRoutes, { prefix: '/memory-shares' });
+await app.register(memoryCommentRoutes, { prefix: '/memory-comments' });
+await app.register(generalChatRoutes, { prefix: '/general-chat' });
 
 // Start server
 const start = async () => {

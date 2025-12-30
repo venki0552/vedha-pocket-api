@@ -28,6 +28,11 @@ const envSchema = z.object({
 
   // Encryption
   MASTER_KEY: z.string().min(32).optional(),
+  ENCRYPTION_KEY: z.string().min(32).optional(),
+
+  // Chat configuration
+  DEFAULT_CHAT_MODEL: z.string().default('anthropic/claude-3.5-sonnet'),
+  OPENROUTER_API_KEY_SHARED: z.string().optional(),
 
   // Server
   PORT: z.coerce.number().default(3001),

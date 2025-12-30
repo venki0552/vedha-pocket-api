@@ -21,6 +21,25 @@ export const ingestQueue = new Queue('ingest', {
   },
 });
 
+// Memory queue for chunking and embedding
+export const memoryQueue = new Queue('memory', {
+  connection: redis,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: {
+      type: 'exponential',
+      delay: 1000,
+    },
+    removeOnComplete: 100,
+    removeOnFail: 50,
+  },
+});
+
+// Alias for backward compatibility
+export function getQueue() {
+  return memoryQueue;
+}
+
 // Job types
 export interface IngestUrlJob {
   type: 'ingest_url';

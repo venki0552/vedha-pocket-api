@@ -49,3 +49,11 @@ export function decrypt(encryptedText: string): string {
 
   return decrypted;
 }
+
+/**
+ * Alias for decrypt - used when decrypting user API keys
+ * The encryptionKey parameter is ignored since we use MASTER_KEY from env
+ */
+export async function getEncryptedKey(encryptedText: string, _encryptionKey?: string): Promise<string> {
+  return decrypt(encryptedText);
+}
