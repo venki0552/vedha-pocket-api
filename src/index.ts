@@ -48,7 +48,7 @@ const app: FastifyInstance = Fastify({
 // Register plugins
 await app.register(cors, {
   origin: env.NODE_ENV === 'production' 
-    ? [/\.vercel\.app$/, /localhost/] 
+    ? [/\.vercel\.app$/, /localhost/, /^chrome-extension:\/\//] 
     : true,
   credentials: true,
 });
