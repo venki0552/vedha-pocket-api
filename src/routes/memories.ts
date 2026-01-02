@@ -12,6 +12,7 @@ const createMemorySchema = z.object({
   color: z.enum(['default', 'coral', 'peach', 'sand', 'mint', 'sage', 'fog', 'storm', 'dusk', 'blossom', 'clay', 'chalk']).default('default'),
   tags: z.array(z.string()).default([]),
   is_pinned: z.boolean().default(false),
+  status: z.enum(['draft', 'published']).default('draft'),
 });
 
 const updateMemorySchema = z.object({
@@ -204,6 +205,8 @@ export async function memoryRoutes(app: FastifyInstance) {
         color: body.color,
         tags: body.tags,
         is_pinned: body.is_pinned,
+        status: body.status,
+        published_at: body.status === 'published' ? new Date().toISOString() : null,
       })
       .select()
       .single();
@@ -214,6 +217,23 @@ export async function memoryRoutes(app: FastifyInstance) {
         code: 'DATABASE_ERROR',
         message: 'Failed to create memory',
       });
+    }
+
+    // If created as published, queue for chunking and embedding
+    if (body.status === 'published' && memory) {
+      try {
+        const queue = getQueue();
+        await queue.add('chunk-memory', {
+          memoryId: memory.id,
+          orgId: body.org_id,
+          userId: userId,
+        }, {
+          priority: 1,
+        });
+      } catch (queueError) {
+        app.log.error(queueError, 'Failed to queue memory for processing');
+        // Don't fail - memory is created, just needs embedding later
+      }
     }
 
     return reply.status(201).send({ data: memory });
