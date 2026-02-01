@@ -201,3 +201,141 @@ export async function retryWithBackoff<T>(
   
   throw lastError;
 }
+
+/**
+ * SSRF Protection: Validates a URL to prevent Server-Side Request Forgery attacks.
+ * Blocks access to:
+ * - Private/internal IP ranges (10.x, 172.16-31.x, 192.168.x)
+ * - Localhost and loopback addresses
+ * - Link-local addresses (169.254.x)
+ * - Cloud metadata endpoints (169.254.169.254)
+ * - IPv6 private/localhost addresses
+ * - Non-HTTP(S) protocols
+ * 
+ * @throws Error if the URL is potentially malicious
+ */
+export function validateUrlForSsrf(url: string): URL {
+  let parsedUrl: URL;
+  
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    throw new Error('Invalid URL format');
+  }
+  
+  // Only allow http and https protocols
+  if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+    throw new Error(`Protocol not allowed: ${parsedUrl.protocol}. Only http and https are permitted.`);
+  }
+  
+  const hostname = parsedUrl.hostname.toLowerCase();
+  
+  // Block localhost and common localhost aliases
+  const localhostPatterns = [
+    'localhost',
+    '127.0.0.1',
+    '::1',
+    '0.0.0.0',
+    '[::1]',
+    '0177.0.0.1', // Octal representation of 127.0.0.1
+    '2130706433', // Decimal representation of 127.0.0.1
+    '0x7f.0.0.1', // Hex representation
+    '127.0.0.1.nip.io', // DNS rebinding service
+    'localtest.me',
+    'lvh.me',
+  ];
+  
+  if (localhostPatterns.some(pattern => hostname === pattern || hostname.endsWith('.' + pattern))) {
+    throw new Error('Access to localhost is not allowed');
+  }
+  
+  // Check if hostname is an IP address and validate it
+  const ipv4Pattern = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+  const ipv4Match = hostname.match(ipv4Pattern);
+  
+  if (ipv4Match) {
+    const octets = ipv4Match.slice(1, 5).map(Number);
+    
+    // Validate octets are in valid range
+    if (octets.some(octet => octet > 255)) {
+      throw new Error('Invalid IP address');
+    }
+    
+    const [a, b, c, d] = octets;
+    
+    // Block private IPv4 ranges
+    // 10.0.0.0/8
+    if (a === 10) {
+      throw new Error('Access to private IP ranges is not allowed');
+    }
+    
+    // 172.16.0.0/12
+    if (a === 172 && b >= 16 && b <= 31) {
+      throw new Error('Access to private IP ranges is not allowed');
+    }
+    
+    // 192.168.0.0/16
+    if (a === 192 && b === 168) {
+      throw new Error('Access to private IP ranges is not allowed');
+    }
+    
+    // 127.0.0.0/8 (loopback)
+    if (a === 127) {
+      throw new Error('Access to loopback addresses is not allowed');
+    }
+    
+    // 169.254.0.0/16 (link-local, includes AWS metadata at 169.254.169.254)
+    if (a === 169 && b === 254) {
+      throw new Error('Access to link-local and cloud metadata addresses is not allowed');
+    }
+    
+    // 0.0.0.0/8 (current network)
+    if (a === 0) {
+      throw new Error('Access to current network addresses is not allowed');
+    }
+    
+    // 100.64.0.0/10 (Carrier-grade NAT)
+    if (a === 100 && b >= 64 && b <= 127) {
+      throw new Error('Access to carrier-grade NAT addresses is not allowed');
+    }
+    
+    // 198.18.0.0/15 (benchmark testing)
+    if (a === 198 && (b === 18 || b === 19)) {
+      throw new Error('Access to benchmark testing addresses is not allowed');
+    }
+    
+    // Broadcast and multicast (224.0.0.0/4 through 255.255.255.255)
+    if (a >= 224) {
+      throw new Error('Access to multicast and broadcast addresses is not allowed');
+    }
+  }
+  
+  // Block IPv6 private/local addresses
+  const ipv6Patterns = [
+    /^::1$/,                           // Loopback
+    /^fe80:/i,                         // Link-local
+    /^fc00:/i, /^fd00:/i,              // Unique local
+    /^ff00:/i,                         // Multicast
+    /^\[::1\]$/,                       // Bracketed loopback
+    /^\[fe80:/i,                       // Bracketed link-local
+    /^\[fc00:/i, /^\[fd00:/i,          // Bracketed unique local
+  ];
+  
+  if (ipv6Patterns.some(pattern => pattern.test(hostname))) {
+    throw new Error('Access to private IPv6 addresses is not allowed');
+  }
+  
+  // Block cloud metadata endpoints via hostname
+  const metadataHostnames = [
+    'metadata.google.internal',
+    'metadata.gcp.internal',
+    'metadata',
+    'instance-data',
+  ];
+  
+  if (metadataHostnames.some(h => hostname === h || hostname.endsWith('.' + h))) {
+    throw new Error('Access to cloud metadata endpoints is not allowed');
+  }
+  
+  return parsedUrl;
+}
